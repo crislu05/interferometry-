@@ -13,6 +13,7 @@ from scipy import signal
 import scipy.fftpack as spf
 import scipy.signal as sps
 import scipy.interpolate as spi
+from scipy.ndimage import gaussian_filter1d
 
 
 # Step 1 get the data and the x position
@@ -26,7 +27,8 @@ for f in os.listdir(script_dir):
     full_path = os.path.join(script_dir, f)
     if os.path.isfile(full_path):
         # Remove all local calibration plot files (including debug plots)
-        if (f.endswith("_local_calibration_spectrum.png") or 
+        if (f.endswith("_local_calibration_spectrum.png") or
+            f.endswith("_calibrated_spectrum.png") or
             f.endswith("_crossing_points.png") or 
             f.endswith("_cubic_spline.png")):
             os.remove(full_path)
@@ -34,6 +36,32 @@ for f in os.listdir(script_dir):
             print(f"  [CLEANUP] Removed old plot: {f}")
 
 print(f"[INFO] Cleanup complete - removed {cleanup_count} old files")
+
+# Load null measurement for baseline subtraction
+null_file = os.path.join(script_dir, "interferometry_data_null (1).txt")
+null_baseline_mean = None
+
+if os.path.exists(null_file):
+    print(f"[INFO] Loading null measurement for baseline subtraction...")
+    try:
+        null_results = rd.read_data3(null_file)
+        null_m_stat = np.array(null_results[4])
+        null_mask = null_m_stat == 16
+        print(f"  [INFO] Null M_STAT filtering: {np.sum(null_mask)}/{len(null_mask)} points kept")
+        
+        # Get null interferogram (ADC2)
+        null_y2 = np.array(null_results[1])[null_mask]
+        
+        # Calculate mean of null interferogram
+        null_baseline_mean = np.mean(null_y2)
+        print(f"  ✓ Null baseline mean (interferogram): {null_baseline_mean:.6e}")
+    except Exception as e:
+        print(f"  [WARN] Failed to load null measurement: {e}")
+        null_baseline_mean = None
+else:
+    print(f"[WARN] Null measurement file not found, skipping baseline subtraction")
+
+print()
 
 # Process both mercury datasets
 mercury_files = [
@@ -124,6 +152,12 @@ for file_name in mercury_files:
     N = 1000000 # these are the number of points that you will resample - try changing this and look how well the resampling follows the data.
     xs = np.linspace(0, x_corr_array[-1], N)
     y = y2[:len(x_corr_array)]
+    
+    # Subtract null baseline mean if available (constant offset removal)
+    if null_baseline_mean is not None:
+        y = y - null_baseline_mean
+        print(f"  [INFO] Subtracted null baseline mean from interferogram: {null_baseline_mean:.6e}")
+    
     cs = spi.CubicSpline(xr, y)
 
 
@@ -140,53 +174,69 @@ for file_name in mercury_files:
 
     # Extract wavelength and intensity arrays
     wavelengths = abs(repx1)
-    intensities = abs(yf1[int(len(yf1)/2+1):len(yf1)])
+    intensities_raw = abs(yf1[int(len(yf1)/2+1):len(yf1)])
     
-    # Calculate baseline noise statistics (200-400 nm)
+    # Calculate baseline mean from 200-400 nm region on unsmoothed data
     baseline_mask = (wavelengths >= 200e-9) & (wavelengths <= 400e-9)
-    baseline_mean = np.mean(intensities[baseline_mask])
-    baseline_std = np.std(intensities[baseline_mask])
+    baseline_mean = np.mean(intensities_raw[baseline_mask])
+    baseline_std = np.std(intensities_raw[baseline_mask])
+    print(f"  [INFO] Baseline mean (200-400 nm): {baseline_mean:.6e}")
+    print(f"  [INFO] Baseline std (200-400 nm): {baseline_std:.6e}")
     
-    # Known mercury spectral lines
-    mercury_lines = {
-        404.66e-9: "Hg violet",
-        435.83e-9: "Hg blue",
-        546.07e-9: "Hg green",
-        576.96e-9: "Hg yellow",
-        579.07e-9: "Hg yellow",
-    }
+    # Apply Gaussian smoothing to FFT spectrum
+    sigma = 1.0  # Adjust this parameter to control smoothing (higher = more smoothing)
+    intensities = gaussian_filter1d(intensities_raw, sigma=sigma)
+    print(f"  [INFO] Applied Gaussian smoothing to FFT spectrum (sigma={sigma})")
     
-    # Calculate SNR for each mercury peak
-    peak_data = []
-    snr_values = []
-    for wavelength, label in mercury_lines.items():
-        idx = np.argmin(np.abs(wavelengths - wavelength))
-        peak_intensity = intensities[idx]
-        snr = (peak_intensity - baseline_mean) / baseline_std if baseline_std > 0 else 0
-        snr_values.append(snr)
-        peak_data.append({'wavelength': wavelengths[idx], 'intensity': peak_intensity, 'snr': snr})
+    # Detect peaks using scipy find_peaks on smoothed data
+    peak_height = baseline_mean + 3 * baseline_std  # Minimum peak height (3 sigma above baseline)
+    peak_distance = 10 # Minimum distance between peaks (in samples)
     
-    # Calculate SNR statistics
-    snr_min = np.min(snr_values)
-    snr_max = np.max(snr_values)
-    snr_mean = np.mean(snr_values)
+    peaks, properties = sps.find_peaks(intensities, height=peak_height, distance=peak_distance)
     
-    print(f"SNR Range: {snr_min:.1f} - {snr_max:.1f} (Mean: {snr_mean:.1f})")
+    peak_wavelengths = wavelengths[peaks]
+    peak_intensities = intensities[peaks]
+    
+    # Calculate SNR for each peak and filter by SNR >= 10
+    peak_snr_values = []
+    if len(peaks) > 0:
+        for peak_int in peak_intensities:
+            snr = (peak_int - baseline_mean) / baseline_std if baseline_std > 0 else 0
+            peak_snr_values.append(snr)
+        
+        # Filter peaks with SNR >= 10
+        snr_threshold = 10
+        mask_high_snr = np.array(peak_snr_values) >= snr_threshold
+        
+        peaks_filtered = peaks[mask_high_snr]
+        peak_wavelengths_filtered = peak_wavelengths[mask_high_snr]
+        peak_intensities_filtered = peak_intensities[mask_high_snr]
+        peak_snr_filtered = np.array(peak_snr_values)[mask_high_snr]
+        
+        print(f"  [INFO] Detected {len(peaks)} peaks total")
+        print(f"  [INFO] Filtered to {len(peaks_filtered)} peaks with SNR >= {snr_threshold}")
+        if len(peaks_filtered) > 0:
+            print(f"  [INFO] Peak details (SNR >= {snr_threshold}):")
+            for i, (wl, inten, snr) in enumerate(zip(peak_wavelengths_filtered, peak_intensities_filtered, peak_snr_filtered)):
+                print(f"    Peak {i+1}: {wl*1e9:.2f} nm, Intensity: {inten:.6e}, SNR: {snr:.2f}")
+        
+        # Update variables to use filtered peaks
+        peaks = peaks_filtered
+        peak_wavelengths = peak_wavelengths_filtered
+        peak_intensities = peak_intensities_filtered
+        peak_snr_values = peak_snr_filtered.tolist()
+    else:
+        print(f"  [INFO] No peaks detected")
     
     plt.figure("Fully corrected spectrum FFT", figsize=(10, 6))
-    plt.title(f'Local Calibration FFT Spectrum - {file_name}\nAvg SNR = {snr_mean:.1f} (Range: {snr_min:.1f}-{snr_max:.1f})', fontsize=12)
-    plt.plot(abs(repx1), abs(yf1[int(len(yf1)/2+1):len(yf1)]))
+    plt.title(f'Local Calibration FFT Spectrum - {file_name}', fontsize=12)
+    plt.plot(wavelengths, intensities, 'b-', linewidth=1, label='Spectrum')
+    if len(peaks) > 0:
+        plt.scatter(peak_wavelengths, peak_intensities, color='r', s=100, marker='x', 
+                   linewidths=2, zorder=5)
+    plt.legend()
     
-    # Plot mercury peaks with labels
-    for peak in peak_data:
-        plt.axvline(x=peak['wavelength'], color='red', linestyle='--', linewidth=1.5, alpha=0.6)
-        plt.annotate(f"{peak['wavelength']*1e9:.1f} nm\nSNR: {peak['snr']:.1f}", 
-                    xy=(peak['wavelength'], peak['intensity']), xytext=(10, 10),
-                    textcoords='offset points', fontsize=8, color='red', fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.8),
-                    arrowprops=dict(arrowstyle='->', color='red', lw=1.5))
-    
-    plt.xlim(200e-9, 1300e-9)
+    plt.xlim(350e-9, 1100e-9)  # Extended range to show visible through near-IR lines
     plt.xlabel('Wavelength (m)')
     plt.ylabel('Intensity (a.u.)')
     plt.grid(True, alpha=0.3)

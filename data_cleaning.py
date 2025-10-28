@@ -145,7 +145,7 @@ for file in files:
         
         print(f"  ✓ Saved filtered data to: {os.path.basename(output_file)}")
 
-        # --- Compute FFT spectrum ---
+        # --- Compute FFT spectrum for both detectors ---
         # Convert position to optical path difference (OPD)
         metres_per_microstep = 3.74e-11  # updated calibration factor from green laser analysis
         opd = pos_filtered * metres_per_microstep  # meters
@@ -162,52 +162,59 @@ for file in files:
         
         # Resample to uniform OPD spacing for accurate FFT
         opd_uniform = np.linspace(opd.min(), opd.max(), len(opd))
-        signal_uniform = interp1d(opd, adc2_filtered, kind='linear')(opd_uniform)
-        print(f"  [DEBUG] Resampled to uniform OPD spacing for FFT accuracy")
         
-        # Remove DC component and recenter the interferogram
-        signal_centered = signal_uniform - np.mean(signal_uniform)
+        # Function to compute FFT spectrum
+        def compute_fft_spectrum(signal_data):
+            signal_uniform = interp1d(opd, signal_data, kind='linear')(opd_uniform)
+            # Remove DC component and recenter the interferogram
+            signal_centered = signal_uniform - np.mean(signal_uniform)
+            # Find the zero-OPD burst (center of interferogram) and recenter
+            center_idx = np.argmax(np.abs(signal_centered))
+            signal_centered = np.roll(signal_centered, len(signal_centered)//2 - center_idx)
+            
+            # Compute FFT on recentered signal
+            fft_result = fft(signal_centered)
+            frequencies = fftfreq(len(opd_uniform), d=dx)
+            
+            # Apply fftshift to center the spectrum
+            fft_result_shifted = fftshift(fft_result)
+            frequencies_shifted = fftshift(frequencies)
+            
+            # Keep only positive frequencies
+            pos_freq_mask = frequencies_shifted > 0
+            pos_frequencies = frequencies_shifted[pos_freq_mask]
+            pos_spectrum = np.abs(fft_result_shifted[pos_freq_mask])
+            
+            # Convert spatial frequency to wavelength
+            wavelengths = 1.0 / pos_frequencies  # meters
+            wavelengths_nm = wavelengths * 1e9  # nanometers
+            
+            # Filter to reasonable wavelength range (200-1000 nm)
+            reasonable_mask = (wavelengths_nm >= 200) & (wavelengths_nm <= 1000)
+            wavelengths_nm = wavelengths_nm[reasonable_mask]
+            pos_spectrum = pos_spectrum[reasonable_mask]
+            
+            # Normalize spectrum
+            if np.max(pos_spectrum) > 0:
+                spectrum_normalized = pos_spectrum / np.max(pos_spectrum)
+            else:
+                spectrum_normalized = pos_spectrum
+            
+            return wavelengths_nm, spectrum_normalized
         
-        # Find the zero-OPD burst (center of interferogram) and recenter
-        center_idx = np.argmax(np.abs(signal_centered))
-        signal_centered = np.roll(signal_centered, len(signal_centered)//2 - center_idx)
+        # Compute FFT for ADC2 (Detector 2)
+        adc1_filtered = adc1[mask] if not is_blue_led else adc1
+        wavelengths_nm, spectrum2_normalized = compute_fft_spectrum(adc2_filtered)
+        dominant_idx2 = np.argmax(spectrum2_normalized)
+        dominant_wavelength2 = wavelengths_nm[dominant_idx2]
         
-        print(f"  [DEBUG] Zero-OPD burst found at index: {center_idx}, recentered to center")
+        # Compute FFT for ADC1 (Detector 1)
+        wavelengths_nm1, spectrum1_normalized = compute_fft_spectrum(adc1_filtered)
+        dominant_idx1 = np.argmax(spectrum1_normalized)
+        dominant_wavelength1 = wavelengths_nm1[dominant_idx1]
         
-        # Compute FFT on recentered signal
-        fft_result = fft(signal_centered)  # Don't use fftshift yet
-        frequencies = fftfreq(len(opd_uniform), d=dx)  # spatial frequency in cycles/meter
-        
-        # Apply fftshift to center the spectrum
-        fft_result_shifted = fftshift(fft_result)
-        frequencies_shifted = fftshift(frequencies)
-        
-        # Keep only positive frequencies (right half of shifted spectrum)
-        pos_freq_mask = frequencies_shifted > 0
-        pos_frequencies = frequencies_shifted[pos_freq_mask]
-        pos_spectrum = np.abs(fft_result_shifted[pos_freq_mask])
-        
-        # Convert spatial frequency to wavelength
-        wavelengths = 1.0 / pos_frequencies  # meters
-        wavelengths_nm = wavelengths * 1e9  # nanometers
-        
-        # Filter to reasonable wavelength range (200-1000 nm)
-        reasonable_mask = (wavelengths_nm >= 200) & (wavelengths_nm <= 1000)
-        wavelengths_nm = wavelengths_nm[reasonable_mask]
-        pos_spectrum = pos_spectrum[reasonable_mask]
-        
-        # Normalize spectrum
-        if np.max(pos_spectrum) > 0:
-            spectrum_normalized = pos_spectrum / np.max(pos_spectrum)
-        else:
-            print("  [WARN] Zero spectrum amplitude detected")
-            spectrum_normalized = pos_spectrum
-        
-        # Find dominant wavelength
-        dominant_idx = np.argmax(spectrum_normalized)
-        dominant_wavelength = wavelengths_nm[dominant_idx]
-        
-        print(f"  [INFO] FFT Analysis - Dominant wavelength: {dominant_wavelength:.1f} nm")
+        print(f"  [INFO] FFT Analysis - ADC2 dominant wavelength: {dominant_wavelength2:.1f} nm")
+        print(f"  [INFO] FFT Analysis - ADC1 dominant wavelength: {dominant_wavelength1:.1f} nm")
         
         # Skip plotting for null measurements
         if "null" in os.path.basename(file).lower():
@@ -237,24 +244,24 @@ for file in files:
         
         ax2.grid(True, alpha=0.3)
         
-        # Third plot: FFT spectrum (linear scale)
-        ax3.plot(wavelengths_nm, spectrum_normalized, 'b-', linewidth=1.5)
-        ax3.axvline(x=dominant_wavelength, color='r', linestyle='--', linewidth=2,
-                   label=f'Dominant: {dominant_wavelength:.1f} nm')
+        # Third plot: ADC1 FFT spectrum
+        ax3.plot(wavelengths_nm1, spectrum1_normalized, 'r-', linewidth=1.5)
+        ax3.axvline(x=dominant_wavelength1, color='b', linestyle='--', linewidth=2,
+                   label=f'Dominant: {dominant_wavelength1:.1f} nm')
         ax3.set_xlabel("Wavelength (nm)")
         ax3.set_ylabel("Normalized Amplitude")
-        ax3.set_title("FFT Spectrum (Linear Scale)")
+        ax3.set_title("ADC1 (Detector 1) FFT Spectrum")
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         ax3.set_xlim(200, 800)  # Focus on visible/UV range
         
-        # Bottom plot: FFT spectrum (log scale)
-        ax4.semilogy(wavelengths_nm, spectrum_normalized + 1e-10, 'g-', linewidth=1.5)  # Add small offset to avoid log(0)
-        ax4.axvline(x=dominant_wavelength, color='r', linestyle='--', linewidth=2,
-                   label=f'Dominant: {dominant_wavelength:.1f} nm')
+        # Bottom plot: ADC2 FFT spectrum
+        ax4.plot(wavelengths_nm, spectrum2_normalized, 'b-', linewidth=1.5)
+        ax4.axvline(x=dominant_wavelength2, color='r', linestyle='--', linewidth=2,
+                   label=f'Dominant: {dominant_wavelength2:.1f} nm')
         ax4.set_xlabel("Wavelength (nm)")
-        ax4.set_ylabel("Normalized Amplitude (Log Scale)")
-        ax4.set_title("FFT Spectrum (Log Scale)")
+        ax4.set_ylabel("Normalized Amplitude")
+        ax4.set_title("ADC2 (Detector 2) FFT Spectrum")
         ax4.legend()
         ax4.grid(True, alpha=0.3)
         ax4.set_xlim(200, 800)  # Focus on visible/UV range
